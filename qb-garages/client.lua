@@ -3009,17 +3009,24 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
     local bodyHealth = GetVehicleBodyHealth(curVeh)
     
     -- Check if this vehicle belongs to a shared garage
-    QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleSharedGarageId', function(sharedGarageId)
-        QBCore.Functions.TriggerCallback('qb-garages:server:CheckOwnership', function(isOwner, isInGarage)
-            if isOwner or (garageType == "gang" and isInGarage) or sharedGarageId then
-                FadeOutVehicle(curVeh, function()
-                    -- Pass the shared garage ID to maintain it
-                    TriggerServerEvent('qb-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType, sharedGarageId)
-                    QBCore.Functions.Notify("Vehicle stored in garage", "success")
+    QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleSharedGarageId', function(vehicleSharedGarageId)
+        
+        -- If vehicle is in a shared garage
+        if vehicleSharedGarageId then
+            print(string.format("^3[DEBUG] Vehicle %s belongs to shared garage %s^7", plate, vehicleSharedGarageId))
+            
+            -- Check if player has access to this shared garage
+            QBCore.Functions.TriggerCallback('qb-garages:server:CheckSharedGarageAccess', function(hasAccess)
+                if hasAccess then
+                    print(string.format("^2[DEBUG] Player has access to shared garage %s^7", vehicleSharedGarageId))
                     
-                    -- Refresh the garage UI if it's open
-                    if isMenuOpen then
-                        if garageType == "shared" and sharedGarageId then
+                    FadeOutVehicle(curVeh, function()
+                        -- Store in shared garage with shared_garage_id preserved
+                        TriggerServerEvent('qb-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, "shared", vehicleSharedGarageId)
+                        QBCore.Functions.Notify("Vehicle stored in shared garage", "success")
+                        
+                        -- Refresh the UI if open
+                        if isMenuOpen and currentSharedGarageId then
                             QBCore.Functions.TriggerCallback('qb-garages:server:GetSharedGarageVehicles', function(vehicles)
                                 if vehicles then
                                     SendNUIMessage({
@@ -3027,8 +3034,25 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
                                         vehicles = FormatVehiclesForNUI(vehicles)
                                     })
                                 end
-                            end, sharedGarageId)
-                        else
+                            end, currentSharedGarageId)
+                        end
+                    end)
+                else
+                    print(string.format("^1[DEBUG] Player does NOT have access to shared garage %s^7", vehicleSharedGarageId))
+                    QBCore.Functions.Notify("You don't have access to this shared garage", "error")
+                end
+            end, vehicleSharedGarageId)
+        else
+            -- Not a shared garage vehicle, check regular ownership
+            print(string.format("^3[DEBUG] Vehicle %s is not in a shared garage, checking ownership^7", plate))
+            
+            QBCore.Functions.TriggerCallback('qb-garages:server:CheckOwnership', function(isOwner, isInGarage)
+                if isOwner or (garageType == "gang" and isInGarage) then
+                    FadeOutVehicle(curVeh, function()
+                        TriggerServerEvent('qb-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType, nil)
+                        QBCore.Functions.Notify("Vehicle stored in garage", "success")
+                        
+                        if isMenuOpen then
                             QBCore.Functions.TriggerCallback('qb-garages:server:GetPersonalVehicles', function(vehicles)
                                 if vehicles then
                                     SendNUIMessage({
@@ -3038,12 +3062,12 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
                                 end
                             end, garageId)
                         end
-                    end
-                end)
-            else
-                QBCore.Functions.Notify("You don't own this vehicle", "error")
-            end
-        end, plate, garageType)
+                    end)
+                else
+                    QBCore.Functions.Notify("You don't own this vehicle", "error")
+                end
+            end, plate, garageType)
+        end
     end, plate)
 end)
 

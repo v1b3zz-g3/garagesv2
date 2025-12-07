@@ -496,14 +496,17 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
-    local citizenid = Player.PlayerData.citizenid    
+    local citizenid = Player.PlayerData.citizenid
+    
+    print(string.format("^3[DEBUG] StoreVehicle - Plate: %s, GarageID: %s, Type: %s, SharedGarageID: %s^7", 
+        plate, garageId, garageType, tostring(sharedGarageId)))
     
     MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "stored"', {}, function(storedColumn)
         local hasStoredColumn = #storedColumn > 0
         MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "state"', {}, function(stateColumn)
             local hasStateColumn = #stateColumn > 0
             
-            -- IMPORTANT FIX: Preserve shared_garage_id if it exists
+            -- Build the query
             local query = 'UPDATE player_vehicles SET garage = ?, mods = ?, fuel = ?, engine = ?, body = ?'
             local params = {garageId, json.encode(props), fuel, engineHealth, bodyHealth}
             
@@ -514,14 +517,17 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
                 query = query .. ', state = 1'
             end
             
-            -- Only update shared_garage_id if explicitly provided, otherwise keep existing value
+            -- CRITICAL: Preserve shared_garage_id if it exists
             if sharedGarageId then
                 query = query .. ', shared_garage_id = ?'
                 table.insert(params, sharedGarageId)
+                print(string.format("^2[DEBUG] Preserving shared_garage_id: %s^7", sharedGarageId))
             end
             
             query = query .. ' WHERE plate = ?'
             table.insert(params, plate)
+            
+            print(string.format("^3[DEBUG] Executing query: %s^7", query))
             
             MySQL.Async.execute(query, params, function(rowsChanged)
                 if rowsChanged > 0 then
@@ -534,7 +540,83 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
                         end
                     end
                     
-                    -- Trigger refresh events
+                    print(string.format("^2[DEBUG] Vehicle %s stored successfully^7", plate))
+                    TriggerClientEvent('QBCore:Notify', src, "Vehicle stored successfully", "success")
+                    TriggerClientEvent('qb-garages:client:RefreshVehicleList', src)
+                else
+                    print(string.format("^1[DEBUG] Failed to store vehicle %s^7", plate))
+                    TriggerClientEvent('QBCore:Notify', src, "Failed to store vehicle", "error")
+                end
+            end)
+        end)
+    end)
+end)
+
+
+QBCore.Functions.CreateCallback('qb-garages:server:CheckSharedGarageAccess', function(source, cb, garageId)
+    local Player = QBCore.Functions.GetPlayer(source)
+    if not Player then return cb(false) end
+    
+    local citizenid = Player.PlayerData.citizenid
+    
+    print(string.format("^3[DEBUG] Checking shared garage access for player %s to garage %s^7", citizenid, garageId))
+    
+    -- Check if player is a member
+    MySQL.Async.fetchAll('SELECT * FROM shared_garage_members WHERE garage_id = ? AND member_citizenid = ?', 
+        {garageId, citizenid}, function(memberResult)
+            if memberResult and #memberResult > 0 then
+                print(string.format("^2[DEBUG] Player is a member of shared garage %s^7", garageId))
+                cb(true)
+            else
+                -- Check if player is the owner
+                MySQL.Async.fetchAll('SELECT * FROM shared_garages WHERE id = ? AND owner_citizenid = ?', 
+                    {garageId, citizenid}, function(ownerResult)
+                        if ownerResult and #ownerResult > 0 then
+                            print(string.format("^2[DEBUG] Player is the owner of shared garage %s^7", garageId))
+                            cb(true)
+                        else
+                            print(string.format("^1[DEBUG] Player has NO access to shared garage %s^7", garageId))
+                            cb(false)
+                        end
+                    end
+                )
+            end
+        end
+    )
+end)
+
+-- Helper function to actually store the vehicle
+function StoreVehicleInDatabase(src, plate, garageId, props, fuel, engineHealth, bodyHealth, sharedGarageId)
+    MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "stored"', {}, function(storedColumn)
+        local hasStoredColumn = #storedColumn > 0
+        MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "state"', {}, function(stateColumn)
+            local hasStateColumn = #stateColumn > 0
+            
+            -- Build the query
+            local query = 'UPDATE player_vehicles SET garage = ?, mods = ?, fuel = ?, engine = ?, body = ?'
+            local params = {garageId, json.encode(props), fuel, engineHealth, bodyHealth}
+            
+            if hasStoredColumn then
+                query = query .. ', stored = 1'
+            end
+            if hasStateColumn then
+                query = query .. ', state = 1'
+            end
+            
+            -- IMPORTANT: Preserve shared_garage_id if it exists
+            if sharedGarageId then
+                query = query .. ', shared_garage_id = ?'
+                table.insert(params, sharedGarageId)
+            end
+            
+            query = query .. ' WHERE plate = ?'
+            table.insert(params, plate)
+            
+            MySQL.Async.execute(query, params, function(rowsChanged)
+                if rowsChanged > 0 then
+                    OutsideVehicles[plate] = nil
+                    
+                    TriggerClientEvent('QBCore:Notify', src, "Vehicle stored successfully", "success")
                     TriggerClientEvent('qb-garages:client:RefreshVehicleList', src)
                 else
                     TriggerClientEvent('QBCore:Notify', src, "Failed to store vehicle", "error")
@@ -542,7 +624,7 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
             end)
         end)
     end)
-end)
+end
 
 
 
@@ -864,9 +946,14 @@ QBCore.Functions.CreateCallback('qb-garages:server:GetSharedGarageVehicles', fun
     local Player = QBCore.Functions.GetPlayer(source)
     if not Player then return cb({}) end
     
-    MySQL.Async.fetchAll('SELECT pv.*, p.charinfo FROM player_vehicles pv LEFT JOIN players p ON pv.citizenid = p.citizenid WHERE pv.shared_garage_id = ? AND pv.state = 1', 
+    print(string.format("^3[DEBUG] GetSharedGarageVehicles - GarageID: %s^7", garageId))
+    
+    -- REMOVED: AND pv.state = 1 - now we show ALL vehicles (in and out)
+    MySQL.Async.fetchAll('SELECT pv.*, p.charinfo FROM player_vehicles pv LEFT JOIN players p ON pv.citizenid = p.citizenid WHERE pv.shared_garage_id = ?', 
         {garageId}, function(vehicles)
             if vehicles and #vehicles > 0 then
+                print(string.format("^2[DEBUG] Found %d vehicles in shared garage %s^7", #vehicles, garageId))
+                
                 for i, vehicle in ipairs(vehicles) do
                     if vehicle.charinfo then
                         local charinfo = json.decode(vehicle.charinfo)
@@ -878,9 +965,13 @@ QBCore.Functions.CreateCallback('qb-garages:server:GetSharedGarageVehicles', fun
                     else
                         vehicles[i].owner_name = "Unknown"
                     end
+                    
+                    print(string.format("^3[DEBUG] Vehicle: %s, State: %s, Owner: %s^7", 
+                        vehicle.plate, vehicle.state, vehicles[i].owner_name))
                 end
                 cb(vehicles)
             else
+                print(string.format("^1[DEBUG] No vehicles found in shared garage %s^7", garageId))
                 cb({})
             end
         end
