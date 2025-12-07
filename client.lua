@@ -995,6 +995,7 @@ RegisterNUICallback('refreshVehicles', function(data, cb)
     cb({status = "refreshing"})
 end)
 
+-- Replace the FormatVehiclesForNUI function in client.lua (around line 1330)
 function FormatVehiclesForNUI(vehicles)
     local formattedVehicles = {}
     local currentGarageId = currentGarage and currentGarage.id or nil    
@@ -1013,6 +1014,9 @@ function FormatVehiclesForNUI(vehicles)
             local isInCurrentGarage = false
             if currentGarage and currentGarage.type == "job" then
                 isInCurrentGarage = true
+            elseif currentGarage and currentGarage.type == "shared" then
+                -- For shared garages, check if vehicle is in THIS shared garage
+                isInCurrentGarage = (vehicle.shared_garage_id and tostring(vehicle.shared_garage_id) == tostring(currentGarageId))
             else
                 if vehicle.garage and currentGarageId then
                     isInCurrentGarage = (vehicle.garage == currentGarageId)
@@ -1039,10 +1043,23 @@ function FormatVehiclesForNUI(vehicles)
                 daysImpounded = 1
             end
             
+            -- IMPORTANT: Properly handle state for shared vehicles
             local isStored = vehicle.state == 1
             local isOut = vehicle.state == 0
             
-            -- IMPORTANT: Include ALL vehicles, even if they're out
+            -- For shared garage vehicles, check if they're really stored in THIS garage
+            if currentGarage and currentGarage.type == "shared" then
+                if vehicle.shared_garage_id and tostring(vehicle.shared_garage_id) == tostring(currentGarageId) then
+                    -- Vehicle belongs to this shared garage
+                    isStored = (vehicle.state == 1)
+                    isOut = (vehicle.state == 0)
+                else
+                    -- Vehicle doesn't belong to this shared garage, skip it
+                    goto continue
+                end
+            end
+            
+            -- Include ALL vehicles
             table.insert(formattedVehicles, {
                 id = i,
                 plate = vehicle.plate,
@@ -1069,6 +1086,8 @@ function FormatVehiclesForNUI(vehicles)
                 daysImpounded = daysImpounded,
                 impoundType = vehicle.impoundtype
             })
+            
+            ::continue::
         end
     end
     
@@ -2162,6 +2181,7 @@ RegisterNUICallback('closeGarage', function(data, cb)
     cb({status = "success"})
 end)
 
+-- Replace the RegisterNUICallback('takeOutVehicle') in client.lua (around line 1700)
 RegisterNUICallback('takeOutVehicle', function(data, cb)
     local garageId = currentGarage.id
     local garageType = currentGarage.type
@@ -2173,12 +2193,14 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
     
     if data.state == 0 then
         QBCore.Functions.Notify("This vehicle is already out of the garage.", "error")
+        cb({status = "error"})
         return
     end
     
     QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleByPlate', function(vehData, isOut)
         if isOut then
             QBCore.Functions.Notify("This vehicle is already outside.", "error")
+            cb({status = "error"})
             return
         end
         
@@ -2203,6 +2225,7 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
         local clearPoint = FindClearSpawnPoint(spawnPoints)
         if not clearPoint then
             QBCore.Functions.Notify("All spawn locations are blocked!", "error")
+            cb({status = "error"})
             return
         end
         
@@ -2210,8 +2233,10 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
             QBCore.Functions.TriggerCallback('qb-garages:server:CheckSharedAccess', function(hasAccess)
                 if hasAccess then
                     TriggerServerEvent('qb-garages:server:TakeOutSharedVehicle', plate, garageId)
+                    cb({status = "success"})
                 else
                     QBCore.Functions.Notify("You don't have access to this vehicle", "error")
+                    cb({status = "error"})
                 end
             end, plate, garageId)
             return
@@ -2231,8 +2256,14 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                     if properties then
                         QBCore.Functions.SetVehicleProperties(veh, properties)
                         
+                        -- FIX: Set health to at least 900 for fresh spawns
+                        -- Data comes in as percentage (0-100), multiply by 10 to get actual health (0-1000)
                         local engineHealth = math.max(data.engine * 10, 900.0)
                         local bodyHealth = math.max(data.body * 10, 900.0)
+                        
+                        -- Ensure minimum health values - if too low, set to perfect
+                        if engineHealth < 900.0 then engineHealth = 1000.0 end
+                        if bodyHealth < 900.0 then bodyHealth = 1000.0 end
                         
                         SetVehicleEngineHealth(veh, engineHealth)
                         SetVehicleBodyHealth(veh, bodyHealth)
@@ -2243,7 +2274,7 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                         SetVehicleUndriveable(veh, false)
                         SetVehicleEngineOn(veh, true, true, false)
                         
-                        -- CRITICAL FIX: Make sure to update the vehicle state in the database
+                        -- Update the vehicle state in the database
                         TriggerServerEvent('qb-garages:server:UpdateVehicleState', plate, 0)
                         
                         if garageType == "gang" and data.storedInGang then
@@ -2268,6 +2299,8 @@ RegisterNUICallback('takeOutVehicle', function(data, cb)
                 TriggerEvent('vehiclekeys:client:SetOwner', QBCore.Functions.GetPlate(veh))
             end
         end, spawnCoords, true)
+        
+        cb({status = "success"})
     end, plate)
 end)
 
@@ -2323,8 +2356,13 @@ RegisterNetEvent('qb-garages:client:TakeOutSharedVehicle', function(plate, vehic
             if properties then
                 QBCore.Functions.SetVehicleProperties(veh, properties)
                 
+                -- FIX: Ensure health is at least 900
                 local engineHealth = math.max(vehicleData.engine, 900.0)
                 local bodyHealth = math.max(vehicleData.body, 900.0)
+                
+                -- Set to perfect condition if health is low
+                if engineHealth < 900.0 then engineHealth = 1000.0 end
+                if bodyHealth < 900.0 then bodyHealth = 1000.0 end
                 
                 SetVehicleEngineHealth(veh, engineHealth)
                 SetVehicleBodyHealth(veh, bodyHealth)
@@ -2343,6 +2381,7 @@ RegisterNetEvent('qb-garages:client:TakeOutSharedVehicle', function(plate, vehic
         end, plate)
     end, spawnCoords, true)
 end)
+
 
 function PlayVehicleTransferAnimation(plate, fromGarageId, toGarageId)
     local garageInfo = nil
@@ -2884,7 +2923,6 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
         local closestGarage = nil
         local closestType = nil
         
-        
         for k, v in pairs(Config.Garages) do
             local dist = #(pos - vector3(v.coords.x, v.coords.y, v.coords.z))
             if dist < closestDist and dist < 10.0 then
@@ -2922,10 +2960,6 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
         
         garageId = closestGarage
         garageType = closestType
-        
-        if garageId then
-            Wait (100)
-        end
     end
     
     if not garageId or not garageType then
@@ -2939,6 +2973,8 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
         garageInfo = Config.JobGarages[garageId]
     elseif garageType == "gang" then
         garageInfo = Config.GangGarages[garageId]
+    elseif garageType == "shared" then
+        garageInfo = sharedGaragesData[garageId]
     end
     
     if not garageInfo then
@@ -2972,28 +3008,43 @@ RegisterNetEvent('qb-garages:client:StoreVehicle', function(data)
     local engineHealth = GetVehicleEngineHealth(curVeh)
     local bodyHealth = GetVehicleBodyHealth(curVeh)
     
-    QBCore.Functions.TriggerCallback('qb-garages:server:CheckOwnership', function(isOwner, isInGarage)
-        if isOwner or (garageType == "gang" and isInGarage) then
-            FadeOutVehicle(curVeh, function()
-                TriggerServerEvent('qb-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
-                QBCore.Functions.Notify("Vehicle stored in garage", "success")
-                
-                -- Refresh the garage UI if it's open
-                if isMenuOpen then
-                    QBCore.Functions.TriggerCallback('qb-garages:server:GetPersonalVehicles', function(vehicles)
-                        if vehicles then
-                            SendNUIMessage({
-                                action = "refreshVehicles",
-                                vehicles = FormatVehiclesForNUI(vehicles)
-                            })
+    -- Check if this vehicle belongs to a shared garage
+    QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleSharedGarageId', function(sharedGarageId)
+        QBCore.Functions.TriggerCallback('qb-garages:server:CheckOwnership', function(isOwner, isInGarage)
+            if isOwner or (garageType == "gang" and isInGarage) or sharedGarageId then
+                FadeOutVehicle(curVeh, function()
+                    -- Pass the shared garage ID to maintain it
+                    TriggerServerEvent('qb-garages:server:StoreVehicle', plate, garageId, props, fuel, engineHealth, bodyHealth, garageType, sharedGarageId)
+                    QBCore.Functions.Notify("Vehicle stored in garage", "success")
+                    
+                    -- Refresh the garage UI if it's open
+                    if isMenuOpen then
+                        if garageType == "shared" and sharedGarageId then
+                            QBCore.Functions.TriggerCallback('qb-garages:server:GetSharedGarageVehicles', function(vehicles)
+                                if vehicles then
+                                    SendNUIMessage({
+                                        action = "refreshVehicles",
+                                        vehicles = FormatVehiclesForNUI(vehicles)
+                                    })
+                                end
+                            end, sharedGarageId)
+                        else
+                            QBCore.Functions.TriggerCallback('qb-garages:server:GetPersonalVehicles', function(vehicles)
+                                if vehicles then
+                                    SendNUIMessage({
+                                        action = "refreshVehicles",
+                                        vehicles = FormatVehiclesForNUI(vehicles)
+                                    })
+                                end
+                            end, garageId)
                         end
-                    end, garageId)
-                end
-            end)
-        else
-            QBCore.Functions.Notify("You don't own this vehicle", "error")
-        end
-    end, plate, garageType)
+                    end
+                end)
+            else
+                QBCore.Functions.Notify("You don't own this vehicle", "error")
+            end
+        end, plate, garageType)
+    end, plate)
 end)
 
 function round(num, numDecimalPlaces)

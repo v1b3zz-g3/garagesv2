@@ -105,6 +105,17 @@ QBCore.Functions.CreateCallback('qb-garages:server:GetVehiclesByGarage', functio
     end)
 end)
 
+QBCore.Functions.CreateCallback('qb-garages:server:GetVehicleSharedGarageId', function(source, cb, plate)
+    MySQL.Async.fetchAll('SELECT shared_garage_id FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+        if result and #result > 0 and result[1].shared_garage_id then
+            cb(result[1].shared_garage_id)
+        else
+            cb(nil)
+        end
+    end)
+end)
+
+
 QBCore.Functions.CreateCallback('qb-garages:server:GetGangVehicles', function(source, cb, gang, garageId)
     local Player = QBCore.Functions.GetPlayer(source)
     if not Player then return cb({}) end
@@ -481,7 +492,7 @@ function GetJobParkingSpots(jobName)
 end
 
 
-RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, props, fuel, engineHealth, bodyHealth, garageType)
+RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, props, fuel, engineHealth, bodyHealth, garageType, sharedGarageId)
     local src = source
     local Player = QBCore.Functions.GetPlayer(src)
     if not Player then return end
@@ -492,15 +503,23 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
         MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "state"', {}, function(stateColumn)
             local hasStateColumn = #stateColumn > 0
             
-            -- FIXED QUERY: Don't clear shared_garage_id automatically
+            -- IMPORTANT FIX: Preserve shared_garage_id if it exists
             local query = 'UPDATE player_vehicles SET garage = ?, mods = ?, fuel = ?, engine = ?, body = ?'
             local params = {garageId, json.encode(props), fuel, engineHealth, bodyHealth}
+            
             if hasStoredColumn then
                 query = query .. ', stored = 1'
             end
             if hasStateColumn then
                 query = query .. ', state = 1'
             end
+            
+            -- Only update shared_garage_id if explicitly provided, otherwise keep existing value
+            if sharedGarageId then
+                query = query .. ', shared_garage_id = ?'
+                table.insert(params, sharedGarageId)
+            end
+            
             query = query .. ' WHERE plate = ?'
             table.insert(params, plate)
             
@@ -524,6 +543,7 @@ RegisterNetEvent('qb-garages:server:StoreVehicle', function(plate, garageId, pro
         end)
     end)
 end)
+
 
 
 RegisterNetEvent('qb-garages:server:UpdateGangVehicleState', function(plate, state)
@@ -949,20 +969,37 @@ function storeVehicleInSharedGarage(src, plate, garageId, props, fuel, engineHea
 end
 
 RegisterNetEvent('qb-garages:server:UpdateVehicleState', function(plate, state)
-    -- Remove the 'stored' column reference
+    local src = source
+    print(string.format("^3[DEBUG] UpdateVehicleState - Plate: %s, State: %s^7", plate, state))
+    
+    -- Add a timestamp to track when vehicle was taken out
+    local currentTime = os.time()
+    
     MySQL.Async.execute('UPDATE player_vehicles SET state = ?, last_update = ? WHERE plate = ?', 
-        {state, os.time(), plate}, 
+        {state, currentTime, plate}, 
         function(rowsChanged)
             if rowsChanged > 0 then
+                print(string.format("^2[DEBUG] Vehicle %s state updated to %s^7", plate, state))
                 
                 -- Update OutsideVehicles tracking table
                 if state == 0 then
-                    OutsideVehicles[plate] = true
+                    OutsideVehicles[plate] = {
+                        time = currentTime,
+                        protected = true -- Protect from immediate impound
+                    }
+                    
+                    -- Remove protection after 60 seconds
+                    SetTimeout(60000, function()
+                        if OutsideVehicles[plate] then
+                            OutsideVehicles[plate].protected = false
+                            print(string.format("^3[DEBUG] Protection removed for vehicle %s^7", plate))
+                        end
+                    end)
                 else
                     OutsideVehicles[plate] = nil
                 end
             else
-                Wait (100)
+                print(string.format("^1[DEBUG] Failed to update vehicle %s state^7", plate))
             end
         end
     )
@@ -1035,25 +1072,65 @@ function CheckForLostVehicles()
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE state = 0', {}, function(vehicles)
         if not vehicles or #vehicles == 0 then return end
         
+        print(string.format("^3[DEBUG] Checking %d outside vehicles for impound^7", #vehicles))
+        
         for _, vehicle in ipairs(vehicles) do
             local lastUpdate = vehicle.last_update or 0
+            local timeDiff = currentTime - lastUpdate
             
-            -- If vehicle has been out for more than the configured timeout
-            if (currentTime - lastUpdate) > Config.LostVehicleTimeout then
-                MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
-                    {
-                        currentTime, 
-                        "Vehicle abandoned or lost", 
-                        "Automated System", 
-                        "police", 
-                        Config.ImpoundFee, 
-                        vehicle.plate
-                    }
-                )
-                if OutsideVehicles[vehicle.plate] then
-                    OutsideVehicles[vehicle.plate] = nil
+            -- Check if vehicle is protected
+            if OutsideVehicles[vehicle.plate] then
+                if OutsideVehicles[vehicle.plate].protected then
+                    print(string.format("^2[DEBUG] Vehicle %s is protected from impound^7", vehicle.plate))
+                    goto continue
                 end
             end
+            
+            -- IMPORTANT: Don't impound vehicles from shared garages immediately
+            if vehicle.shared_garage_id then
+                -- Give shared garage vehicles more time (2 hours instead of 1)
+                local timeoutForShared = Config.LostVehicleTimeout * 2
+                
+                if timeDiff > timeoutForShared then
+                    print(string.format("^3[DEBUG] Shared garage vehicle %s timed out, impounding^7", vehicle.plate))
+                    MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
+                        {
+                            currentTime, 
+                            "Vehicle abandoned or lost", 
+                            "Automated System", 
+                            "police", 
+                            Config.ImpoundFee, 
+                            vehicle.plate
+                        }
+                    )
+                    if OutsideVehicles[vehicle.plate] then
+                        OutsideVehicles[vehicle.plate] = nil
+                    end
+                else
+                    print(string.format("^3[DEBUG] Shared garage vehicle %s still within timeout (%.0f/%.0f seconds)^7", 
+                        vehicle.plate, timeDiff, timeoutForShared))
+                end
+            else
+                -- Regular vehicle timeout
+                if timeDiff > Config.LostVehicleTimeout then
+                    print(string.format("^3[DEBUG] Regular vehicle %s timed out, impounding^7", vehicle.plate))
+                    MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
+                        {
+                            currentTime, 
+                            "Vehicle abandoned or lost", 
+                            "Automated System", 
+                            "police", 
+                            Config.ImpoundFee, 
+                            vehicle.plate
+                        }
+                    )
+                    if OutsideVehicles[vehicle.plate] then
+                        OutsideVehicles[vehicle.plate] = nil
+                    end
+                end
+            end
+            
+            ::continue::
         end
     end)
 end
@@ -1105,21 +1182,161 @@ CreateThread(function()
     end
 end)
 
+--RegisterNUICallback('takeOutVehicle', function(data, cb)
+--    local garageId = currentGarage.id
+--    local garageType = currentGarage.type
+--    local plate = data.plate
+--    local model = data.model
+--    
+--    SetNuiFocus(false, false)
+--    isMenuOpen = false
+--    
+--    if data.state == 0 then
+--        QBCore.Functions.Notify("This vehicle is already out of the garage.", "error")
+--        return
+--    end
+--    
+--    QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleByPlate', function(vehData, isOut)
+--        if isOut then
+--            QBCore.Functions.Notify("This vehicle is already outside.", "error")
+--            return
+--        end
+--        
+--        local garageInfo = {}
+--        if garageType == "public" then
+--            garageInfo = Config.Garages[garageId]
+--        elseif garageType == "job" then
+--            garageInfo = Config.JobGarages[garageId]
+--        elseif garageType == "gang" then
+--            garageInfo = Config.GangGarages[garageId]
+--        elseif garageType == "shared" then
+--            garageInfo = sharedGaragesData[garageId]
+--        end
+--        
+--        local spawnPoints = nil
+--        if garageInfo.spawnPoints then
+--            spawnPoints = garageInfo.spawnPoints
+--        else
+--            spawnPoints = {garageInfo.spawnPoint}
+--        end
+--        
+--        local clearPoint = FindClearSpawnPoint(spawnPoints)
+--        if not clearPoint then
+--            QBCore.Functions.Notify("All spawn locations are blocked!", "error")
+--            return
+--        end
+--        
+--        if garageType == "shared" then
+--            QBCore.Functions.TriggerCallback('qb-garages:server:CheckSharedAccess', function(hasAccess)
+--                if hasAccess then
+--                    TriggerServerEvent('qb-garages:server:TakeOutSharedVehicle', plate, garageId)
+--                else
+--                    QBCore.Functions.Notify("You don't have access to this vehicle", "error")
+--                end
+--            end, plate, garageId)
+--            return
+--        end
+--        
+--        local spawnCoords = vector3(clearPoint.x, clearPoint.y, clearPoint.z)
+--        
+--        QBCore.Functions.SpawnVehicle(model, function(veh)
+--            SetEntityHeading(veh, clearPoint.w)
+--            exports['cdn-fuel']:SetFuel(veh, data.fuel)
+--            SetVehicleNumberPlateText(veh, plate)
+--            
+--            FadeInVehicle(veh)
+--            
+--            if garageType == "public" or garageType == "gang" then
+--                QBCore.Functions.TriggerCallback('qb-garages:server:GetVehicleProperties', function(properties)
+--                    if properties then
+--                        QBCore.Functions.SetVehicleProperties(veh, properties)
+--                        
+--                        -- FIX: Set health to at least 900 for fresh spawns
+--                        local engineHealth = math.max(data.engine * 10, 900.0)
+--                        local bodyHealth = math.max(data.body * 10, 900.0)
+--                        
+--                        -- Ensure minimum health values
+--                        if engineHealth < 900.0 then engineHealth = 1000.0 end
+--                        if bodyHealth < 900.0 then bodyHealth = 1000.0 end
+--                        
+--                        SetVehicleEngineHealth(veh, engineHealth)
+--                        SetVehicleBodyHealth(veh, bodyHealth)
+--                        SetVehicleDirtLevel(veh, 0.0)
+--                        
+--                        FixEngineSmoke(veh)
+--                        
+--                        SetVehicleUndriveable(veh, false)
+--                        SetVehicleEngineOn(veh, true, true, false)
+--                        
+--                        -- Update the vehicle state in the database
+--                        TriggerServerEvent('qb-garages:server:UpdateVehicleState', plate, 0)
+--                        
+--                        if garageType == "gang" and data.storedInGang then
+--                            TriggerServerEvent('qb-garages:server:UpdateGangVehicleState', plate, 0)
+--                        end
+--                        
+--                        QBCore.Functions.Notify("Vehicle taken out", "success")
+--                        TriggerEvent('vehiclekeys:client:SetOwner', plate)
+--                    end
+--                end, plate)
+--            else 
+--                -- Job vehicle
+--                SetVehicleEngineHealth(veh, 1000.0)
+--                SetVehicleBodyHealth(veh, 1000.0)
+--                SetVehicleDirtLevel(veh, 0.0)
+--                SetVehicleUndriveable(veh, false)
+--                SetVehicleEngineOn(veh, true, true, false)
+--                
+--                FixEngineSmoke(veh)
+--                
+--                QBCore.Functions.Notify("Job vehicle taken out", "success")
+--                TriggerEvent('vehiclekeys:client:SetOwner', QBCore.Functions.GetPlate(veh))
+--            end
+--        end, spawnCoords, true)
+--    end, plate)
+--end)
+
+
 function takeOutSharedVehicle(src, plate, garageId)
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND shared_garage_id = ? AND state = 1', 
+    print(string.format("^3[DEBUG] takeOutSharedVehicle - Plate: %s, GarageID: %s^7", plate, garageId))
+    
+    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ? AND shared_garage_id = ?', 
         {plate, garageId}, function(result)
             if not result or #result == 0 then
+                print("^1[DEBUG] Vehicle not found in shared garage or already out^7")
                 TriggerClientEvent('QBCore:Notify', src, "Vehicle not found or already taken out", "error")
                 return
             end
             
-            -- Just update state without removing shared_garage_id association
-            MySQL.Async.execute('UPDATE player_vehicles SET state = 0, stored = 0 WHERE plate = ?', 
-                {plate}, function(rowsChanged)
+            print(string.format("^3[DEBUG] Vehicle found - Current state: %s^7", result[1].state))
+            
+            local currentTime = os.time()
+            
+            -- Update state but KEEP shared_garage_id AND set last_update
+            MySQL.Async.execute('UPDATE player_vehicles SET state = 0, stored = 0, last_update = ? WHERE plate = ?', 
+                {currentTime, plate}, function(rowsChanged)
                     if rowsChanged > 0 then
+                        print("^2[DEBUG] Vehicle state updated to OUT (0) with protection^7")
+                        
+                        -- Mark as protected from impound for 60 seconds
+                        OutsideVehicles[plate] = {
+                            time = currentTime,
+                            protected = true,
+                            sharedGarage = garageId
+                        }
+                        
+                        -- Remove protection after 60 seconds
+                        SetTimeout(60000, function()
+                            if OutsideVehicles[plate] then
+                                OutsideVehicles[plate].protected = false
+                                print(string.format("^3[DEBUG] Protection removed for vehicle %s^7", plate))
+                            end
+                        end)
+                        
                         TriggerClientEvent('QBCore:Notify', src, "Vehicle taken out from shared garage", "success")
                         TriggerClientEvent('qb-garages:client:TakeOutSharedVehicle', src, plate, result[1])
                     else
+                        print("^1[DEBUG] Failed to update vehicle state^7")
                         TriggerClientEvent('QBCore:Notify', src, "Failed to take out vehicle", "error")
                     end
                 end
@@ -1190,36 +1407,78 @@ RegisterNetEvent('qb-garages:server:HandleDeletedVehicle', function(plate)
     
     plate = plate:gsub("%s+", "")
     
+    print(string.format("^3[DEBUG] HandleDeletedVehicle called for plate: %s^7", plate))
+    
+    -- Check if vehicle is protected or in shared garage
+    if OutsideVehicles[plate] then
+        if OutsideVehicles[plate].protected then
+            print(string.format("^2[DEBUG] Vehicle %s is protected, not impounding^7", plate))
+            return
+        end
+        
+        if OutsideVehicles[plate].sharedGarage then
+            print(string.format("^2[DEBUG] Vehicle %s belongs to shared garage, not impounding on delete^7", plate))
+            return
+        end
+    end
+    
     MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
         if result and #result > 0 then
-            MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ? AND state = 0', 
-                {os.time(), plate}, 
-                function(rowsChanged)
-                    if rowsChanged > 0 then
+            -- Check if vehicle belongs to a shared garage
+            if result[1].shared_garage_id then
+                print(string.format("^2[DEBUG] Vehicle %s belongs to shared garage %s, not impounding^7", 
+                    plate, result[1].shared_garage_id))
+                return
+            end
+            
+            -- Only impound if vehicle is currently out (state = 0)
+            if result[1].state == 0 then
+                MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ?', 
+                    {os.time(), plate}, 
+                    function(rowsChanged)
+                        if rowsChanged > 0 then
+                            print(string.format("^3[DEBUG] Vehicle %s impounded due to deletion^7", plate))
+                        end
                     end
-                end
-            )
+                )
+            end
         end
     end)
 end)
 
 RegisterNetEvent('QBCore:Server:DeleteVehicle', function(netId)
-    -- This event is triggered from the client when a vehicle is deleted
     if netId then
         local vehicle = NetworkGetEntityFromNetworkId(netId)
         if DoesEntityExist(vehicle) then
             local plate = GetVehicleNumberPlateText(vehicle)
             if plate then
-                plate = plate:gsub("%s+", "") -- Remove spaces
+                plate = plate:gsub("%s+", "")
                 
-                -- Update the database to set the vehicle to impound
-                MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ? AND state = 0', 
-                    {os.time(), plate}, 
-                    function(rowsChanged)
-                        if rowsChanged > 0 then
+                print(string.format("^3[DEBUG] QBCore:Server:DeleteVehicle called for plate: %s^7", plate))
+                
+                -- Check if protected or shared
+                if OutsideVehicles[plate] then
+                    if OutsideVehicles[plate].protected or OutsideVehicles[plate].sharedGarage then
+                        print(string.format("^2[DEBUG] Vehicle %s is protected/shared, not impounding^7", plate))
+                        return
+                    end
+                end
+                
+                -- Check database for shared_garage_id
+                MySQL.Async.fetchAll('SELECT shared_garage_id, state FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+                    if result and #result > 0 then
+                        if result[1].shared_garage_id then
+                            print(string.format("^2[DEBUG] Vehicle %s belongs to shared garage, not impounding^7", plate))
+                            return
+                        end
+                        
+                        if result[1].state == 0 then
+                            MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ? WHERE plate = ?', 
+                                {os.time(), plate}
+                            )
                         end
                     end
-                )
+                end)
             end
         end
     end
@@ -1228,44 +1487,29 @@ end)
 RegisterNetEvent('QBCore:Server:OnVehicleDelete', function(plate)
     if not plate then return end
     
-    -- Clean the plate (remove spaces)
     plate = plate:gsub("%s+", "")
     
-    -- Check if this is a player-owned vehicle
-    MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
-        if result and #result > 0 then
-            local currentTime = os.time()
-            
-            -- Update vehicle to impound state
-            MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
-                {
-                    currentTime, 
-                    "Vehicle was towed", 
-                    "City Towing", 
-                    "police", 
-                    Config.ImpoundFee, 
-                    plate
-                }
-            )
-            if OutsideVehicles[plate] then
-                OutsideVehicles[plate] = nil
-            end
+    print(string.format("^3[DEBUG] QBCore:Server:OnVehicleDelete called for plate: %s^7", plate))
+    
+    -- Check if protected or shared
+    if OutsideVehicles[plate] then
+        if OutsideVehicles[plate].protected or OutsideVehicles[plate].sharedGarage then
+            print(string.format("^2[DEBUG] Vehicle %s is protected/shared, not impounding^7", plate))
+            return
         end
-    end)
-end)
-
-
-RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
-    if plate then
-        -- Clean the plate (remove spaces)
-        plate = plate:gsub("%s+", "")
-        
-        -- Check if this is a player-owned vehicle
-        MySQL.Async.fetchAll('SELECT * FROM player_vehicles WHERE plate = ?', {plate}, function(result)
-            if result and #result > 0 then
+    end
+    
+    -- Check database for shared_garage_id
+    MySQL.Async.fetchAll('SELECT shared_garage_id, state FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+        if result and #result > 0 then
+            if result[1].shared_garage_id then
+                print(string.format("^2[DEBUG] Vehicle %s belongs to shared garage, not impounding^7", plate))
+                return
+            end
+            
+            if result[1].state == 0 then
                 local currentTime = os.time()
                 
-                -- Update vehicle to impound state
                 MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
                     {
                         currentTime, 
@@ -1278,6 +1522,50 @@ RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
                 )
                 if OutsideVehicles[plate] then
                     OutsideVehicles[plate] = nil
+                end
+            end
+        end
+    end)
+end)
+
+RegisterNetEvent('vehiclemod:server:syncDeletion', function(netId, plate)
+    if plate then
+        plate = plate:gsub("%s+", "")
+        
+        print(string.format("^3[DEBUG] vehiclemod:server:syncDeletion called for plate: %s^7", plate))
+        
+        -- Check if protected or shared
+        if OutsideVehicles[plate] then
+            if OutsideVehicles[plate].protected or OutsideVehicles[plate].sharedGarage then
+                print(string.format("^2[DEBUG] Vehicle %s is protected/shared, not impounding^7", plate))
+                return
+            end
+        end
+        
+        -- Check database for shared_garage_id
+        MySQL.Async.fetchAll('SELECT shared_garage_id, state FROM player_vehicles WHERE plate = ?', {plate}, function(result)
+            if result and #result > 0 then
+                if result[1].shared_garage_id then
+                    print(string.format("^2[DEBUG] Vehicle %s belongs to shared garage, not impounding^7", plate))
+                    return
+                end
+                
+                if result[1].state == 0 then
+                    local currentTime = os.time()
+                    
+                    MySQL.Async.execute('UPDATE player_vehicles SET state = 2, garage = "impound", impoundedtime = ?, impoundreason = ?, impoundedby = ?, impoundtype = ?, impoundfee = ? WHERE plate = ?', 
+                        {
+                            currentTime, 
+                            "Vehicle was towed", 
+                            "City Towing", 
+                            "police", 
+                            Config.ImpoundFee, 
+                            plate
+                        }
+                    )
+                    if OutsideVehicles[plate] then
+                        OutsideVehicles[plate] = nil
+                    end
                 end
             end
         end)
@@ -1742,10 +2030,20 @@ end)
 AddEventHandler('onResourceStart', function(resourceName)
     if GetCurrentResourceName() ~= resourceName then return end
     
-    MySQL.Async.fetchAll('SHOW COLUMNS FROM player_vehicles LIKE "impoundedtime"', {}, function(result)
+    Wait(2000) -- Wait for database
+    
+    -- Initialize OutsideVehicles with current outside vehicles
+    MySQL.Async.fetchAll('SELECT plate, shared_garage_id, last_update FROM player_vehicles WHERE state = 0', {}, function(result)
         if result and #result > 0 then
-        else
-            Wait (100)
+            for _, v in ipairs(result) do
+                OutsideVehicles[v.plate] = {
+                    time = v.last_update or os.time(),
+                    protected = false,
+                    sharedGarage = v.shared_garage_id
+                }
+                print(string.format("^3[DEBUG] Loaded outside vehicle: %s (Shared: %s)^7", 
+                    v.plate, tostring(v.shared_garage_id)))
+            end
         end
     end)
 end)
